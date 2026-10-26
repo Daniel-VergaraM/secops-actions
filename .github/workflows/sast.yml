@@ -1,19 +1,25 @@
-name: "Seguridad · SAST"
-# Análisis estático del código PROPIO (no corre nada, solo lee el código fuente).
-# Motor: Semgrep (sin config, cero secretos, corre igual en público o privado).
+name: "Security · SAST"
+# Static analysis of OWN code (runs nothing, only reads the source code).
+# Engine: Semgrep (no config, zero secrets, runs the same in public or private).
 #
-# CodeQL vive aparte, en codeql-sast.yml, porque en repos privados requiere
-# licencia (GitHub Advanced Security) y ese archivo decide solo si puede correr
-# según la visibilidad del repo. Se dispara automáticamente cuando ESTE workflow
-# termina (workflow_run) — en la práctica, este archivo es su dependencia.
+# CodeQL lives separately, in codeql-sast.yml, because on private repos it
+# requires a license (GitHub Advanced Security) and that file decides on its
+# own whether it can run based on the repo's visibility. It triggers
+# automatically when THIS workflow finishes (workflow_run) — in practice,
+# this file is its dependency.
 
 on:
   pull_request:
   push:
     branches: [main, master]
   schedule:
-    - cron: '30 4 * * 1' # lunes 04:30 UTC
+    - cron: '30 4 * * 1' # Monday 04:30 UTC
   workflow_dispatch:
+  workflow_call:
+    secrets:
+      semgrep_token:
+        required: false
+        description: 'Optional Semgrep App Token (the Semgrep CLI reads it via the SEMGREP_APP_TOKEN env var)'
 
 permissions:
   contents: read
@@ -32,15 +38,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: "Semgrep (config auto: detecta lenguaje y reglas solo, sin token)"
-        # --config auto descarga el set de reglas de la Semgrep Registry que aplica
-        # a lo que encuentre en el repo. No necesita SEMGREP_APP_TOKEN para esto.
-        # continue-on-error: la severidad real la decides tú viendo el SARIF en la
-        # pestaña Security; si prefieres que el PR falle con hallazgos, quita esta línea.
+      - name: "Semgrep (config auto: detects language and rules on its own, no token needed)"
+        # --config auto downloads the Semgrep Registry rule set that applies
+        # to whatever it finds in the repo. It doesn't need SEMGREP_APP_TOKEN for this.
+        # continue-on-error: you decide actual severity by viewing the SARIF in the
+        # Security tab; if you'd rather the PR fail on findings, remove this line.
         continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.semgrep_token }}
         run: semgrep scan --config auto --sarif > semgrep-results.sarif
 
-      - name: Subir resultados a GitHub Security
+      - name: Upload results to GitHub Security
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:

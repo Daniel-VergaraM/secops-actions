@@ -1,31 +1,31 @@
-name: "Detectar stack del repositorio"
+name: "Detect repository stack"
 description: >
-  Detecta lenguajes (vía la API de GitHub/Linguist, sin heurísticas propias que haya
-  que mantener), a qué subconjunto de lenguajes de CodeQL corresponden, y cómo se
-  levanta la aplicación (Dockerfile / docker-compose), para que SAST, DAST, IAST y
-  Fuzzing no necesiten configuración manual de lenguaje por parte del usuario.
+  Detects languages (via the GitHub/Linguist API, with no custom heuristics to
+  maintain), which subset of CodeQL languages they map to, and how the
+  application is started (Dockerfile / docker-compose), so that SAST, DAST, IAST
+  and Fuzzing don't need manual language configuration from the user.
 
 outputs:
   languages:
-    description: "JSON array con los lenguajes que reporta GitHub Linguist (en minúsculas)"
+    description: "JSON array with the languages reported by GitHub Linguist (lowercase)"
     value: ${{ steps.linguist.outputs.languages }}
   codeql_languages:
-    description: "JSON array con el subconjunto soportado por github/codeql-action"
+    description: "JSON array with the subset supported by github/codeql-action"
     value: ${{ steps.linguist.outputs.codeql_languages }}
   primary_language:
-    description: "Lenguaje con más bytes de código en el repo, según Linguist"
+    description: "Language with the most bytes of code in the repo, according to Linguist"
     value: ${{ steps.linguist.outputs.primary_language }}
   has_dockerfile:
-    description: "'true' si hay un Dockerfile en la raíz del repo"
+    description: "'true' if there is a Dockerfile at the repo root"
     value: ${{ steps.runner.outputs.has_dockerfile }}
   has_compose:
-    description: "'true' si hay docker-compose.yml/yaml o compose.yml/yaml en la raíz"
+    description: "'true' if there is a docker-compose.yml/yaml or compose.yml/yaml at the root"
     value: ${{ steps.runner.outputs.has_compose }}
 
 runs:
   using: "composite"
   steps:
-    - name: Leer lenguajes vía API de GitHub (Linguist)
+    - name: Read languages via the GitHub API (Linguist)
       id: linguist
       shell: bash
       env:
@@ -34,13 +34,13 @@ runs:
         set -euo pipefail
 
         langs_json=$(gh api "repos/${{ github.repository }}/languages")
-        echo "Lenguajes reportados por Linguist: $langs_json"
+        echo "Languages reported by Linguist: $langs_json"
 
         primary=$(echo "$langs_json" | jq -r 'to_entries | sort_by(-.value) | .[0].key // "unknown"')
         all=$(echo "$langs_json" | jq -c '[keys[] | ascii_downcase]')
 
-        # Mapeo a los nombres de lenguaje que entiende github/codeql-action.
-        # Referencia: https://codeql.github.com/docs/codeql-overview/supported-languages-and-frameworks/
+        # Mapping to the language names understood by github/codeql-action.
+        # Reference: https://codeql.github.com/docs/codeql-overview/supported-languages-and-frameworks/
         codeql=$(echo "$langs_json" | jq -c '
           [keys[] | ascii_downcase] as $l |
           [
@@ -59,7 +59,7 @@ runs:
         echo "codeql_languages=$codeql" >> "$GITHUB_OUTPUT"
         echo "primary_language=$primary" >> "$GITHUB_OUTPUT"
 
-    - name: Detectar cómo se levanta la aplicación
+    - name: Detect how the application is started
       id: runner
       shell: bash
       run: |

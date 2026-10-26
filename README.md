@@ -14,51 +14,100 @@ the project is written in.
 | IAST | `iast.yml` | Running app | from the inside, with an agent (approximated) | native coverage + ZAP |
 | Fuzzing | `fuzzing.yml` | Running app | malformed input | Schemathesis if a schema exists (OpenAPI/GraphQL), otherwise ffuf (black-box) |
 
-## Usage: this doesn't run in this repo, it runs in yours
+## Usage: consume it as a reusable workflow, don't copy `.github/`
 
-This repo is a package of workflows to copy, not a project with code to scan.
-To use it:
+This repo ships as **reusable GitHub Actions workflows**
+(`on: workflow_call`). The target repo doesn't need a local copy of
+`.github/` at all — it just points a thin workflow file at this repo's
+`security-pipeline.yml`, which chains the other 6:
 
-```bash
-git clone https://github.com/Daniel-VergaraM/secops-actions.git
-cp -r secops-actions/.github /path/to/your/project/
-cd /path/to/your/project
-git add .github
-git commit -m "ci: add security pipeline (secops-actions)"
-git push
+```yaml
+# .github/workflows/security.yml in your repo
+name: Security Pipeline
+on:
+  pull_request:
+  push: { branches: [main] }
+  schedule: [{ cron: '0 5 * * *' }]
+  workflow_dispatch:
+
+jobs:
+  security:
+    uses: Daniel-VergaraM/secops-actions/.github/workflows/security-pipeline.yml@v1
+    secrets: inherit
+    with:
+      dast_target_url: ''        # optional: your staging URL
+      iast_start_cmd: ''         # optional: e.g. "node dist/server.js"
 ```
 
-If the target project already has `.github/workflows`, just copy what's
-missing: the 6 `.yml` files in `.github/workflows/` and the full
-`.github/actions/detect-stack/` folder.
+`secrets: inherit` is what lets `semgrep_token` (if you have one, see the
+table below) flow from your repo's secrets into `sast.yml` without you
+having to name it explicitly.
 
-Alternative with no terminal cloning: on GitHub, mark this repo as a
-**Template repository** (Settings → General → Template repository) and have
-each team use the **"Use this template"** button to spin up a new repo that
-already has `.github/` in it — same result, no terminal steps.
+### Available inputs
 
-## What you need to configure in the TARGET repo (where you copied `.github/` to)
+All inputs are optional strings; every one has a safe default and the
+pipeline runs fine with none of them set.
 
-Two things go in the target repo's **Settings** before any of this works:
+| Input | Default | What it's for |
+|---|---|---|
+| `dast_target_url` | `''` | URL to attack with DAST instead of letting the runner spin up the app itself (equivalent to the old `DAST_TARGET_URL` repo variable) |
+| `target_url` | `''` | Same as `dast_target_url`, but as a one-off override for a single manual run |
+| `scan_type` | `'baseline'` | DAST mode: `baseline` (passive, fast) or `full` (active, slower and more aggressive) |
+| `dast_app_port` | `'8080'` | Port the app listens on, shared by DAST, IAST and Fuzzing |
+| `iast_start_cmd` | `''` | Command that starts the app for IAST (e.g. `"node dist/server.js"`, `"python -m app"`, `"go run ."`); without it, `iast` skips itself |
+| `openapi_path` | `''` | OpenAPI/Swagger spec path, if it's not at one of the common paths Fuzzing already tries |
+| `graphql_path` | `''` | GraphQL endpoint path, if it's not `/graphql` |
+| `codeql_force_run` | `'false'` | Forces CodeQL on private repos that do have a GitHub Advanced Security license |
+
+Secret: `semgrep_token` (optional) — Semgrep App Token for inline PR comments
+via the Semgrep AppSec Platform; passed through `secrets: inherit`. Semgrep
+still runs fine without it, just without that integration.
+
+### Calling one technique at a time
+
+You don't have to run the whole pipeline. Each individual workflow is also a
+valid reusable workflow on its own, with the same inputs listed above (scoped
+to what that file actually uses):
+
+```yaml
+jobs:
+  sast:
+    uses: Daniel-VergaraM/secops-actions/.github/workflows/sast.yml@v1
+    secrets: inherit
+  sca:
+    uses: Daniel-VergaraM/secops-actions/.github/workflows/sca.yml@v1
+    secrets: inherit
+```
+
+## Unavoidable manual configuration
+
+This is minimum configuration, not zero-config — these three items are
+GitHub platform limits, not something this pipeline could automate away:
 
 1. **Settings → Actions → General → Workflow permissions** → "Read and write
    permissions". Without this, the step that uploads results to the Security
    tab (`upload-sarif`) fails silently even though the scan ran fine.
 2. **Settings → Code security → Dependency graph** → enabled (free). Used by
    `dependency-review-action` inside `sca.yml`.
+3. This repo (`secops-actions`) needs a **`v1` tag/release** to exist before
+   `uses: .../security-pipeline.yml@v1` resolves in a consumer repo. Create
+   it once (`git tag v1 && git push origin v1`, or a GitHub Release) after
+   the workflows here are in the shape you want to pin.
 
 With that, **SAST (Semgrep) and SCA already work on their own**, nothing else
 to touch. CodeQL (`codeql-sast.yml`) needs `sast.yml` to already exist on the
 default branch before it can trigger (they're chained via `workflow_run`, see
 below) — so its first run lands after the first push, not on it.
 
-### Semi-automatic configuration: optional variables
+### Optional repo variables (same thing, named differently per workflow)
 
-Everything below is **optional** and lives in `Settings → Secrets and
-variables → Actions → Variables` in the target repo (these are variables,
-visible within the repo, not secrets — except the one marked "(secret)"). No
-workflow fails for not having them: each one just skips the part it can't
-resolve and leaves a `::notice::` explaining what was missing.
+The table above covers the `workflow_call` inputs. If you'd rather configure
+by repo variable instead of passing `with:` every time (or you're running a
+workflow via `workflow_dispatch`/`schedule`, where `with:` isn't available),
+the same knobs also exist as `Settings → Secrets and variables → Actions →
+Variables` in the consumer repo. No workflow fails for not having them: each
+one just skips the part it can't resolve and leaves a `::notice::` explaining
+what was missing.
 
 | Variable | Used by | When you need it | If you don't set it |
 |---|---|---|---|
@@ -156,6 +205,7 @@ want it to block).
 .github/
   actions/detect-stack/action.yml   # language detection + how the app starts
   workflows/
+    security-pipeline.yml  # orchestrator — chains the 6 workflows below
     sast.yml           # SAST — Semgrep
     codeql-sast.yml     # SAST — CodeQL (gated on visibility/GHAS)
     sca.yml             # SCA — Trivy + dependency-review

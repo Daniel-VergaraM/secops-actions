@@ -1,40 +1,62 @@
-name: "Seguridad · DAST"
-# Ataca la app CORRIENDO, desde afuera, como lo haría un atacante real (caja negra).
-# Motor: OWASP ZAP (baseline = pasivo y rápido; full = activo y más agresivo).
+name: "Security · DAST"
+# Attacks the RUNNING app, from the outside, like a real attacker would (black box).
+# Engine: OWASP ZAP (baseline = passive and fast; full = active and more aggressive).
 #
-# Resolución del target, en este orden:
-#   1) target_url que pases manualmente al disparar el workflow
-#   2) variable de repo DAST_TARGET_URL (tu staging/preview real) — RECOMENDADO
-#   3) si no hay ninguna de las dos: intenta levantar la app él mismo con
-#      docker-compose.yml o Dockerfile y atacar localhost
-#   4) si nada de eso existe, falla con un mensaje explicando qué falta
+# Target resolution, in this order:
+#   1) target_url passed manually when triggering the workflow
+#   2) repo variable DAST_TARGET_URL (your real staging/preview) — RECOMMENDED
+#   3) if neither of those exists: tries to spin up the app itself with
+#      docker-compose.yml or Dockerfile and attack localhost
+#   4) if none of that exists, fails with a message explaining what's missing
 
 on:
   schedule:
-    - cron: '0 6 * * 1' # semanal
+    - cron: '0 6 * * 1' # weekly
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'URL a atacar (vacío = usar DAST_TARGET_URL o levantar la app yo mismo)'
+        description: 'URL to attack (empty = use DAST_TARGET_URL or spin up the app myself)'
         required: false
         default: ''
       scan_type:
-        description: 'baseline (pasivo) o full (activo, más lento y agresivo)'
+        description: 'baseline (passive) or full (active, slower and more aggressive)'
         required: false
         default: 'baseline'
         type: choice
         options: [baseline, full]
+  workflow_call:
+    inputs:
+      target_url:
+        description: 'URL to attack (empty = use dast_target_url/DAST_TARGET_URL or spin up the app myself)'
+        required: false
+        default: ''
+        type: string
+      scan_type:
+        description: 'baseline (passive) or full (active, slower and more aggressive)'
+        required: false
+        default: 'baseline'
+        type: string
+      dast_target_url:
+        description: 'Equivalent to the repo variable DAST_TARGET_URL, for consumer repos that call this workflow as reusable'
+        required: false
+        default: ''
+        type: string
+      dast_app_port:
+        description: 'Equivalent to the repo variable DAST_APP_PORT, for consumer repos that call this workflow as reusable'
+        required: false
+        default: '8080'
+        type: string
 
 permissions:
   contents: read
   security-events: write
 
 jobs:
-  resolver-target:
+  resolve-target:
     runs-on: ubuntu-latest
     outputs:
       target: ${{ steps.resolve.outputs.target }}
-      modo: ${{ steps.resolve.outputs.modo }}
+      mode: ${{ steps.resolve.outputs.mode }}
     steps:
       - uses: actions/checkout@v4
       - id: detect
@@ -43,66 +65,66 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          port="${{ vars.DAST_APP_PORT || '8080' }}"
+          port="${{ inputs.dast_app_port || vars.DAST_APP_PORT || '8080' }}"
 
           if [ -n "${{ inputs.target_url }}" ]; then
             echo "target=${{ inputs.target_url }}" >> "$GITHUB_OUTPUT"
-            echo "modo=externo" >> "$GITHUB_OUTPUT"
-          elif [ -n "${{ vars.DAST_TARGET_URL }}" ]; then
-            echo "target=${{ vars.DAST_TARGET_URL }}" >> "$GITHUB_OUTPUT"
-            echo "modo=externo" >> "$GITHUB_OUTPUT"
+            echo "mode=external" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.dast_target_url || vars.DAST_TARGET_URL }}" ]; then
+            echo "target=${{ inputs.dast_target_url || vars.DAST_TARGET_URL }}" >> "$GITHUB_OUTPUT"
+            echo "mode=external" >> "$GITHUB_OUTPUT"
           elif [ "${{ steps.detect.outputs.has_compose }}" = "true" ]; then
             echo "target=http://localhost:${port}" >> "$GITHUB_OUTPUT"
-            echo "modo=compose" >> "$GITHUB_OUTPUT"
+            echo "mode=compose" >> "$GITHUB_OUTPUT"
           elif [ "${{ steps.detect.outputs.has_dockerfile }}" = "true" ]; then
             echo "target=http://localhost:${port}" >> "$GITHUB_OUTPUT"
-            echo "modo=dockerfile" >> "$GITHUB_OUTPUT"
+            echo "mode=dockerfile" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::No encontré docker-compose.yml ni Dockerfile, y no definiste target_url ni la variable de repo DAST_TARGET_URL. Define DAST_TARGET_URL en Settings → Secrets and variables → Actions → Variables apuntando a tu entorno de staging, o dispara este workflow manualmente con target_url."
+            echo "::error::Could not find docker-compose.yml or Dockerfile, and you didn't set target_url or the repo variable DAST_TARGET_URL. Define DAST_TARGET_URL in Settings → Secrets and variables → Actions → Variables pointing to your staging environment, or trigger this workflow manually with target_url."
             exit 1
           fi
 
   dast:
-    needs: resolver-target
+    needs: resolve-target
     runs-on: ubuntu-latest
     env:
-      APP_PORT: ${{ vars.DAST_APP_PORT || '8080' }}
+      APP_PORT: ${{ inputs.dast_app_port || vars.DAST_APP_PORT || '8080' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Levantar con docker compose
-        if: needs.resolver-target.outputs.modo == 'compose'
+      - name: Spin up with docker compose
+        if: needs.resolve-target.outputs.mode == 'compose'
         run: docker compose up -d --build
 
-      - name: Levantar con Dockerfile
-        if: needs.resolver-target.outputs.modo == 'dockerfile'
+      - name: Spin up with Dockerfile
+        if: needs.resolve-target.outputs.mode == 'dockerfile'
         run: |
-          docker build -t app-bajo-prueba .
-          docker run -d -p "${APP_PORT}:${APP_PORT}" app-bajo-prueba
+          docker build -t app-under-test .
+          docker run -d -p "${APP_PORT}:${APP_PORT}" app-under-test
 
-      - name: Esperar a que el target responda
-        if: needs.resolver-target.outputs.modo == 'compose' || needs.resolver-target.outputs.modo == 'dockerfile'
+      - name: Wait for the target to respond
+        if: needs.resolve-target.outputs.mode == 'compose' || needs.resolve-target.outputs.mode == 'dockerfile'
         run: |
           for i in $(seq 1 30); do
-            curl -sf "${{ needs.resolver-target.outputs.target }}" > /dev/null && exit 0
-            echo "Esperando a ${{ needs.resolver-target.outputs.target }} ($i/30)..."
+            curl -sf "${{ needs.resolve-target.outputs.target }}" > /dev/null && exit 0
+            echo "Waiting for ${{ needs.resolve-target.outputs.target }} ($i/30)..."
             sleep 5
           done
-          echo "::warning::El target no respondió a tiempo; ZAP igual intentará conectarse."
+          echo "::warning::The target did not respond in time; ZAP will still try to connect."
 
-      - name: ZAP Baseline Scan (pasivo)
+      - name: ZAP Baseline Scan (passive)
         if: inputs.scan_type != 'full'
         uses: zaproxy/action-baseline@v0.15.0
         with:
-          target: ${{ needs.resolver-target.outputs.target }}
+          target: ${{ needs.resolve-target.outputs.target }}
           fail_action: false
           cmd_options: '-a'
 
-      - name: ZAP Full Scan (activo)
+      - name: ZAP Full Scan (active)
         if: inputs.scan_type == 'full'
         uses: zaproxy/action-full-scan@v0.12.0
         with:
-          target: ${{ needs.resolver-target.outputs.target }}
+          target: ${{ needs.resolve-target.outputs.target }}
           fail_action: false
 
       - uses: actions/upload-artifact@v4
@@ -115,6 +137,6 @@ jobs:
             report_json.json
           if-no-files-found: ignore
 
-# Nota: los action de ZAP ya suben su propio reporte como artifact y pueden abrir un
-# Issue con los hallazgos (desactivado aquí con fail_action/`cmd_options`). Si quieres
-# que el PR falle ante hallazgos de riesgo alto, cambia fail_action a true.
+# Note: the ZAP actions already upload their own report as an artifact and can open an
+# Issue with the findings (disabled here via fail_action/`cmd_options`). If you want
+# the PR to fail on high-risk findings, change fail_action to true.

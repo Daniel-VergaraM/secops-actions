@@ -1,0 +1,135 @@
+name: Security Pipeline
+# Orchestrator: chains this repo's 6 reusable workflows (sast, sca,
+# codeql-sast, dast, iast, fuzzing) into a single one a consumer repo can
+# invoke with `uses: .../security-pipeline.yml@v1`. It duplicates no logic:
+# each job just forwards inputs/secrets to the actual workflow doing the work.
+
+on:
+  workflow_call:
+    inputs:
+      codeql_force_run:
+        description: 'Forces CodeQL on private repos with a GHAS license'
+        type: string
+        required: false
+        default: 'false'
+      target_url:
+        description: 'URL to attack with DAST (empty = resolve automatically)'
+        type: string
+        required: false
+        default: ''
+      scan_type:
+        description: 'DAST: baseline (passive) or full (active)'
+        type: string
+        required: false
+        default: 'baseline'
+      dast_target_url:
+        description: 'Equivalent to the repo variable DAST_TARGET_URL'
+        type: string
+        required: false
+        default: ''
+      dast_app_port:
+        description: 'Port the app listens on (DAST/IAST/Fuzzing) if not 8080'
+        type: string
+        required: false
+        default: '8080'
+      iast_start_cmd:
+        description: 'Command that starts the app for IAST (e.g.: "node dist/server.js")'
+        type: string
+        required: false
+        default: ''
+      openapi_path:
+        description: 'OpenAPI/Swagger spec path, if it is not at a common path'
+        type: string
+        required: false
+        default: ''
+      graphql_path:
+        description: 'GraphQL endpoint path, if it is not /graphql'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      semgrep_token:
+        required: false
+        description: 'Optional Semgrep App Token (read by sast.yml as SEMGREP_APP_TOKEN)'
+  workflow_dispatch:
+    inputs:
+      codeql_force_run:
+        description: 'Forces CodeQL on private repos with a GHAS license'
+        type: string
+        required: false
+        default: 'false'
+      target_url:
+        description: 'URL to attack with DAST (empty = resolve automatically)'
+        type: string
+        required: false
+        default: ''
+      scan_type:
+        description: 'DAST: baseline (passive) or full (active)'
+        type: string
+        required: false
+        default: 'baseline'
+      dast_target_url:
+        description: 'Equivalent to the repo variable DAST_TARGET_URL'
+        type: string
+        required: false
+        default: ''
+      dast_app_port:
+        description: 'Port the app listens on (DAST/IAST/Fuzzing) if not 8080'
+        type: string
+        required: false
+        default: '8080'
+      iast_start_cmd:
+        description: 'Command that starts the app for IAST (e.g.: "node dist/server.js")'
+        type: string
+        required: false
+        default: ''
+      openapi_path:
+        description: 'OpenAPI/Swagger spec path, if it is not at a common path'
+        type: string
+        required: false
+        default: ''
+      graphql_path:
+        description: 'GraphQL endpoint path, if it is not /graphql'
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  sast:
+    uses: ./.github/workflows/sast.yml
+    secrets: inherit
+
+  sca:
+    uses: ./.github/workflows/sca.yml
+    secrets: inherit
+
+  codeql:
+    needs: sast
+    uses: ./.github/workflows/codeql-sast.yml
+    with:
+      codeql_force_run: ${{ inputs.codeql_force_run }}
+    secrets: inherit
+
+  dast:
+    uses: ./.github/workflows/dast.yml
+    with:
+      target_url: ${{ inputs.target_url }}
+      scan_type: ${{ inputs.scan_type }}
+      dast_target_url: ${{ inputs.dast_target_url }}
+      dast_app_port: ${{ inputs.dast_app_port }}
+    secrets: inherit
+
+  iast:
+    uses: ./.github/workflows/iast.yml
+    with:
+      iast_start_cmd: ${{ inputs.iast_start_cmd }}
+      dast_app_port: ${{ inputs.dast_app_port }}
+    secrets: inherit
+
+  fuzzing:
+    uses: ./.github/workflows/fuzzing.yml
+    with:
+      openapi_path: ${{ inputs.openapi_path }}
+      graphql_path: ${{ inputs.graphql_path }}
+      dast_app_port: ${{ inputs.dast_app_port }}
+    secrets: inherit

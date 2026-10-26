@@ -1,16 +1,17 @@
-name: "Seguridad · SCA"
-# Análisis de librerías de TERCEROS (no corre nada, solo lee manifiestos/lockfiles).
-# Motor: Trivy (fs scan) — detecta solo npm/yarn/pnpm, pip/poetry/pipenv, go.mod/go.sum,
-# Gemfile.lock, composer.lock, Cargo.lock, csproj/packages.lock.json, etc. sin configurar
-# nada por lenguaje. Se complementa con dependency-review-action en PRs.
+name: "Security · SCA"
+# Analysis of THIRD-PARTY libraries (runs nothing, only reads manifests/lockfiles).
+# Engine: Trivy (fs scan) — detects npm/yarn/pnpm, pip/poetry/pipenv, go.mod/go.sum,
+# Gemfile.lock, composer.lock, Cargo.lock, csproj/packages.lock.json, etc. with no
+# per-language configuration. Complemented by dependency-review-action on PRs.
 
 on:
   pull_request:
   push:
     branches: [main, master]
   schedule:
-    - cron: '0 5 * * *' # diario: te avisa de CVEs nuevos en libs que ya tenías instaladas
+    - cron: '0 5 * * *' # daily: alerts you to new CVEs in libs you already had installed
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -27,14 +28,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cachear la base de datos de vulnerabilidades de Trivy
+      - name: Cache the Trivy vulnerability database
         uses: actions/cache@v4
         with:
           path: ~/.cache/trivy
           key: trivy-db-${{ github.run_id }}
           restore-keys: trivy-db-
 
-      - name: Trivy · reporte completo (no rompe el pipeline, solo informa)
+      - name: Trivy · full report (doesn't break the pipeline, just informs)
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
@@ -44,7 +45,7 @@ jobs:
           severity: 'CRITICAL,HIGH,MEDIUM'
           exit-code: '0'
 
-      - name: Subir resultados a GitHub Security
+      - name: Upload results to GitHub Security
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -57,7 +58,7 @@ jobs:
           name: trivy-sarif
           path: trivy-results.sarif
 
-      - name: Trivy · gate (rompe el pipeline solo si hay CRITICAL)
+      - name: Trivy · gate (breaks the pipeline only on CRITICAL findings)
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
@@ -67,9 +68,9 @@ jobs:
           exit-code: '1'
 
   dependency-review:
-    # Compara únicamente las dependencias que cambian en el PR contra la base.
-    # Requiere que el repo tenga el "dependency graph" activo (gratis, en
-    # Settings → Code security). No requiere GHAS.
+    # Compares only the dependencies that change in the PR against the base.
+    # Requires the repo to have the "dependency graph" enabled (free, under
+    # Settings → Code security). Does not require GHAS.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
