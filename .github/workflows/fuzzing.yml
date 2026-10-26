@@ -1,0 +1,214 @@
+name: "Seguridad · Fuzzing"
+# Entradas malformadas/aleatorias contra la app CORRIENDO para provocar fallos.
+#
+# Tres niveles, de más a menos "inteligente", elegidos automáticamente según lo
+# que la propia app exponga en tiempo de ejecución (nadie lo configura a mano):
+#
+#   1) REST con spec OpenAPI/Swagger  -> Schemathesis genera miles de casos
+#      límite a partir del spec.
+#   2) GraphQL                        -> Schemathesis usa introspección del
+#      propio endpoint (no hace falta spec: GraphQL se autodescribe).
+#   3) Nada de lo anterior (API sin documentar, la mayoría de los casos reales)
+#      -> fallback con ffuf: primero descubre endpoints por wordlist
+#      (SecLists), después golpea cada endpoint encontrado con payloads
+#      "naughty strings" en query string y en el body, buscando 5xx y
+#      respuestas fuera de lo normal. No es tan preciso como un fuzzer
+#      schema-aware, pero no depende de que documentes nada.
+#
+# Variables opcionales (Settings → Secrets and variables → Actions → Variables):
+#   OPENAPI_PATH   ruta del spec si no está en una de las rutas comunes
+#   GRAPHQL_PATH   ruta del endpoint GraphQL si no es /graphql
+#   DAST_APP_PORT  puerto de la app si no es 8080
+#
+# Para fuzzing de librerías/parsers en C/C++/Go/Java/Python/Rust/Swift (funciones
+# puras, no HTTP) la herramienta de referencia es ClusterFuzzLite de Google, pero
+# esa SIEMPRE necesita que escribas al menos un "fuzz target" a mano — no hay
+# forma de autodetectarlo de forma genérica. Queda documentada como siguiente
+# paso en SECURITY-PIPELINE.md en vez de incluirse aquí como workflow (fallaría
+# en repos sin ese harness).
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 8 * * 2' # semanal
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      has_compose: ${{ steps.detect.outputs.has_compose }}
+      has_dockerfile: ${{ steps.detect.outputs.has_dockerfile }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        uses: ./.github/actions/detect-stack
+
+  fuzz:
+    needs: detect
+    if: needs.detect.outputs.has_compose == 'true' || needs.detect.outputs.has_dockerfile == 'true'
+    runs-on: ubuntu-latest
+    env:
+      APP_PORT: ${{ vars.DAST_APP_PORT || '8080' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Levantar con docker compose
+        if: needs.detect.outputs.has_compose == 'true'
+        run: docker compose up -d --build
+
+      - name: Levantar con Dockerfile
+        if: needs.detect.outputs.has_compose != 'true' && needs.detect.outputs.has_dockerfile == 'true'
+        run: |
+          docker build -t app-bajo-prueba .
+          docker run -d -p "${APP_PORT}:${APP_PORT}" app-bajo-prueba
+
+      - name: Esperar a que el target responda
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf "http://localhost:${APP_PORT}" > /dev/null && break
+            sleep 5
+          done
+
+      - name: "Buscar schema: OpenAPI/Swagger (REST) o introspección (GraphQL)"
+        id: find-schema
+        run: |
+          set -e
+
+          # --- 1) REST: ¿hay un spec OpenAPI/Swagger servido por la app? ---
+          if [ -n "${{ vars.OPENAPI_PATH }}" ]; then
+            candidatos_openapi="${{ vars.OPENAPI_PATH }}"
+          else
+            candidatos_openapi="/openapi.json /openapi.yaml /swagger.json /v3/api-docs /api/openapi.json /docs/openapi.json /api-docs"
+          fi
+
+          for p in $candidatos_openapi; do
+            url="http://localhost:${APP_PORT}${p}"
+            if curl -sf "$url" -o /dev/null; then
+              echo "Spec OpenAPI/Swagger encontrado en $url"
+              echo "kind=openapi" >> "$GITHUB_OUTPUT"
+              echo "schema_url=$url" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          # --- 2) GraphQL: ¿responde a una query de introspección mínima? ---
+          if [ -n "${{ vars.GRAPHQL_PATH }}" ]; then
+            candidatos_graphql="${{ vars.GRAPHQL_PATH }}"
+          else
+            candidatos_graphql="/graphql /api/graphql /v1/graphql /graphql/console"
+          fi
+
+          for p in $candidatos_graphql; do
+            url="http://localhost:${APP_PORT}${p}"
+            resp=$(curl -sf -X POST "$url" \
+              -H 'Content-Type: application/json' \
+              -d '{"query":"{__typename}"}' || true)
+            if echo "$resp" | jq -e '.data.__typename' > /dev/null 2>&1; then
+              echo "Endpoint GraphQL encontrado en $url"
+              echo "kind=graphql" >> "$GITHUB_OUTPUT"
+              echo "schema_url=$url" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          # --- 3) Nada autodescriptivo: se usará el fallback con ffuf ---
+          echo "::notice::No encontré spec OpenAPI/Swagger ni endpoint GraphQL en las rutas comunes. Si tu API los expone en otra ruta, define OPENAPI_PATH o GRAPHQL_PATH como variable de repo. Sin eso, uso un fuzzer de caja negra (ffuf) que no necesita spec."
+          echo "kind=none" >> "$GITHUB_OUTPUT"
+
+      # --- Camino 1 y 2: hay schema (OpenAPI o GraphQL) -> Schemathesis ---
+      - name: Fuzzing con Schemathesis (schema-aware)
+        if: steps.find-schema.outputs.kind == 'openapi' || steps.find-schema.outputs.kind == 'graphql'
+        uses: schemathesis/action@v2
+        with:
+          schema: ${{ steps.find-schema.outputs.schema_url }}
+          checks: all
+          report: true
+
+      # --- Camino 3: sin schema -> ffuf (caja negra, basado en wordlists) ---
+      - name: "ffuf · instalar"
+        if: steps.find-schema.outputs.kind == 'none'
+        run: |
+          go install github.com/ffuf/ffuf/v2@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: "ffuf · descargar wordlists (SecLists, solo los 2 archivos que usamos)"
+        if: steps.find-schema.outputs.kind == 'none'
+        run: |
+          curl -sSL -o endpoints.txt \
+            https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints.txt
+          curl -sSL -o payloads.txt \
+            https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/big-list-of-naughty-strings.txt
+
+      - name: "ffuf · etapa 1: descubrir endpoints no documentados"
+        if: steps.find-schema.outputs.kind == 'none'
+        run: |
+          ffuf -w endpoints.txt -u "http://localhost:${APP_PORT}/FUZZ" \
+            -mc 200,201,204,301,302,400,401,403,405 \
+            -t 30 -timeout 5 -of json -o discovered.json
+
+      - name: "ffuf · etapa 2: payloads malformados contra cada endpoint encontrado"
+        if: steps.find-schema.outputs.kind == 'none'
+        run: |
+          set -e
+          mkdir -p ffuf-fuzz-results
+
+          mapfile -t endpoints < <(jq -r '.results[].url' discovered.json 2>/dev/null | sort -u | head -n 20)
+          echo "Endpoints descubiertos (tope 20 por tiempo de CI): ${#endpoints[@]}"
+
+          if [ "${#endpoints[@]}" -eq 0 ]; then
+            echo "::notice::ffuf no encontró endpoints con el wordlist de SecLists. Puede que tu API no siga convenciones REST comunes (/api/..., /v1/..., etc.) — en ese caso no hay forma de autodescubrirla sin pistas adicionales."
+            exit 0
+          fi
+
+          i=0
+          for ep in "${endpoints[@]}"; do
+            i=$((i+1))
+            safe=$(echo "$ep" | sed 's/[^a-zA-Z0-9]/_/g')
+
+            # Query string: pega cada payload como valor de un parámetro genérico.
+            ffuf -w payloads.txt -u "${ep}?q=FUZZ" \
+              -mc all -fc 200,301,302,404 -t 20 -timeout 5 \
+              -of json -o "ffuf-fuzz-results/${i}-${safe}-query.json" || true
+
+            # Body: manda cada payload como cuerpo crudo (JSON malformado incluido).
+            ffuf -w payloads.txt -X POST -d 'FUZZ' -H 'Content-Type: application/json' \
+              -u "${ep}" -mc all -fc 200,201,400,404 -t 20 -timeout 5 \
+              -of json -o "ffuf-fuzz-results/${i}-${safe}-body.json" || true
+          done
+
+      - name: "ffuf · resumen de hallazgos"
+        if: steps.find-schema.outputs.kind == 'none'
+        run: |
+          {
+            echo "# Fuzzing sin schema (ffuf) — resumen"
+            echo
+            for f in ffuf-fuzz-results/*.json; do
+              [ -e "$f" ] || continue
+              count=$(jq '.results | length' "$f" 2>/dev/null || echo 0)
+              if [ "$count" -gt 0 ]; then
+                echo "- $f: $count respuesta(s) fuera de lo normal (revisar el JSON)"
+              fi
+            done
+          } | tee fuzz-summary.md
+
+      - uses: actions/upload-artifact@v4
+        if: steps.find-schema.outputs.kind == 'none'
+        with:
+          name: ffuf-fuzz-results
+          path: |
+            discovered.json
+            ffuf-fuzz-results/**
+            fuzz-summary.md
+          if-no-files-found: ignore
+
+  sin-app-para-fuzzear:
+    needs: detect
+    if: needs.detect.outputs.has_compose != 'true' && needs.detect.outputs.has_dockerfile != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::notice::No encontré docker-compose.yml ni Dockerfile, así que no hay forma de levantar la app para atacarla. Añade uno de los dos, o adapta el paso 'Levantar con...' de este workflow a cómo arrancas tu app."

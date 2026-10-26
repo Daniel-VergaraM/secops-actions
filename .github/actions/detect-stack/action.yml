@@ -1,0 +1,78 @@
+name: "Detectar stack del repositorio"
+description: >
+  Detecta lenguajes (vía la API de GitHub/Linguist, sin heurísticas propias que haya
+  que mantener), a qué subconjunto de lenguajes de CodeQL corresponden, y cómo se
+  levanta la aplicación (Dockerfile / docker-compose), para que SAST, DAST, IAST y
+  Fuzzing no necesiten configuración manual de lenguaje por parte del usuario.
+
+outputs:
+  languages:
+    description: "JSON array con los lenguajes que reporta GitHub Linguist (en minúsculas)"
+    value: ${{ steps.linguist.outputs.languages }}
+  codeql_languages:
+    description: "JSON array con el subconjunto soportado por github/codeql-action"
+    value: ${{ steps.linguist.outputs.codeql_languages }}
+  primary_language:
+    description: "Lenguaje con más bytes de código en el repo, según Linguist"
+    value: ${{ steps.linguist.outputs.primary_language }}
+  has_dockerfile:
+    description: "'true' si hay un Dockerfile en la raíz del repo"
+    value: ${{ steps.runner.outputs.has_dockerfile }}
+  has_compose:
+    description: "'true' si hay docker-compose.yml/yaml o compose.yml/yaml en la raíz"
+    value: ${{ steps.runner.outputs.has_compose }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Leer lenguajes vía API de GitHub (Linguist)
+      id: linguist
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        langs_json=$(gh api "repos/${{ github.repository }}/languages")
+        echo "Lenguajes reportados por Linguist: $langs_json"
+
+        primary=$(echo "$langs_json" | jq -r 'to_entries | sort_by(-.value) | .[0].key // "unknown"')
+        all=$(echo "$langs_json" | jq -c '[keys[] | ascii_downcase]')
+
+        # Mapeo a los nombres de lenguaje que entiende github/codeql-action.
+        # Referencia: https://codeql.github.com/docs/codeql-overview/supported-languages-and-frameworks/
+        codeql=$(echo "$langs_json" | jq -c '
+          [keys[] | ascii_downcase] as $l |
+          [
+            (if ($l | any(. == "typescript" or . == "javascript")) then "javascript-typescript" else empty end),
+            (if ($l | any(. == "python")) then "python" else empty end),
+            (if ($l | any(. == "go")) then "go" else empty end),
+            (if ($l | any(. == "java" or . == "kotlin")) then "java-kotlin" else empty end),
+            (if ($l | any(. == "c" or . == "c++")) then "c-cpp" else empty end),
+            (if ($l | any(. == "c#")) then "csharp" else empty end),
+            (if ($l | any(. == "ruby")) then "ruby" else empty end),
+            (if ($l | any(. == "swift")) then "swift" else empty end)
+          ] | unique
+        ')
+
+        echo "languages=$all" >> "$GITHUB_OUTPUT"
+        echo "codeql_languages=$codeql" >> "$GITHUB_OUTPUT"
+        echo "primary_language=$primary" >> "$GITHUB_OUTPUT"
+
+    - name: Detectar cómo se levanta la aplicación
+      id: runner
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        has_dockerfile=false
+        has_compose=false
+
+        [ -f "Dockerfile" ] && has_dockerfile=true
+
+        for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+          [ -f "$f" ] && has_compose=true
+        done
+
+        echo "has_dockerfile=$has_dockerfile" >> "$GITHUB_OUTPUT"
+        echo "has_compose=$has_compose" >> "$GITHUB_OUTPUT"

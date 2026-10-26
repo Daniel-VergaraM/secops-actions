@@ -1,0 +1,118 @@
+name: "Seguridad · SAST (CodeQL)"
+# Complemento de sast.yml (Semgrep). Separado en su propio archivo porque:
+#
+#   1) CodeQL Action es gratis sin límites en repos PÚBLICOS, pero en repos
+#      PRIVADOS requiere GitHub Advanced Security (de pago). Este workflow
+#      consulta la visibilidad real del repo vía la API de GitHub antes de
+#      correr nada, y se SALTA solo en privados para no fallar por
+#      licenciamiento ni gastar minutos de CI en algo que no vas a poder usar.
+#      Si tu org sí tiene GHAS, pon la variable de repo CODEQL_FORCE_RUN=true
+#      (Settings → Secrets and variables → Actions → Variables) para forzarlo
+#      también en privados.
+#
+#   2) GitHub Actions no deja usar `needs:` entre archivos de workflow
+#      distintos, así que la forma real de encadenarlos es con el trigger
+#      workflow_run: este archivo se dispara en cuanto "Seguridad · SAST"
+#      (sast.yml) termina — es decir, sast.yml es, en los hechos, su
+#      dependencia. workflow_run solo se activa para workflows que ya existen
+#      en la rama default, así que la primera vez tendrás que fusionar ambos
+#      archivos a main/master antes de ver correr este.
+#
+# Si en Settings → Code security ya tienes activado el "default setup" de
+# CodeQL para este repo, NO uses también este workflow: GitHub no permite
+# tener el setup por defecto y un workflow avanzado de CodeQL corriendo a la
+# vez para el mismo lenguaje.
+
+on:
+  workflow_run:
+    workflows: ["Seguridad · SAST"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  visibilidad:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    outputs:
+      es_publico: ${{ steps.check.outputs.es_publico }}
+      ref: ${{ steps.check.outputs.ref }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          visibility=$(gh api "repos/${{ github.repository }}" --jq .visibility)
+          echo "Visibilidad del repo: $visibility"
+
+          if [ "$visibility" = "public" ]; then
+            echo "es_publico=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "es_publico=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "ref=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  detect:
+    needs: visibilidad
+    if: needs.visibilidad.outputs.es_publico == 'true' || vars.CODEQL_FORCE_RUN == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      codeql_languages: ${{ steps.detect.outputs.codeql_languages }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.visibilidad.outputs.ref }}
+      - id: detect
+        uses: ./.github/actions/detect-stack
+
+  codeql:
+    needs: [visibilidad, detect]
+    if: >-
+      (needs.visibilidad.outputs.es_publico == 'true' || vars.CODEQL_FORCE_RUN == 'true')
+      && needs.detect.outputs.codeql_languages != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.detect.outputs.codeql_languages) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.visibilidad.outputs.ref }}
+
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analizar
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "codeql-${{ matrix.language }}"
+
+  repo-privado-sin-ghas:
+    needs: visibilidad
+    if: needs.visibilidad.outputs.es_publico != 'true' && vars.CODEQL_FORCE_RUN != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::notice::Repo privado y CODEQL_FORCE_RUN no está en 'true', así que me salto CodeQL (requiere GitHub Advanced Security de pago en repos privados). Semgrep, en sast.yml, ya te cubre el SAST sin costo. Si tu organización sí tiene GHAS, define la variable de repo CODEQL_FORCE_RUN=true para correrlo igual."

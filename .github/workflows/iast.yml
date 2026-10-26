@@ -1,0 +1,132 @@
+name: "Seguridad · IAST (aproximación)"
+# LEE ESTO PRIMERO: no existe hoy una herramienta de IAST real (con taint-tracking)
+# que sea gratis/open-source y cubra Go, TypeScript/Node y Python a la vez.
+#   - Contrast Community Edition (la única IAST gratuita seria) fue DESCONTINUADA
+#     el 30-jun-2025. Hoy Contrast Assess es 100% comercial.
+#   - OpenRASP (Baidu, open source) sigue libre pero está inactivo desde 2022 y
+#     solo cubre bien Java y PHP sobre servidores de aplicaciones tradicionales.
+#   - Datadog Code Security (IAST) es comercial, con trial de 14 días.
+#
+# Lo que este workflow SÍ hace, sin pagar nada: levanta tu app con instrumentación
+# de cobertura NATIVA del lenguaje (un agente real corriendo adentro del proceso:
+# go cover / coverage.py / c8 / jacoco), la ataca con ZAP mientras corre, y cruza
+# ambos resultados. Eso te dice qué código se ejecutó realmente durante el ataque
+# (vista de caja gris / "glass-box testing") — útil y real, pero NO es taint-tracking:
+# no te dice si un dato del atacante llegó sin sanitizar a una query SQL, por ejemplo.
+# Si necesitas eso de verdad, la opción honesta es pagar Datadog IAST o Contrast
+# Assess (ver SECURITY-PIPELINE.md).
+#
+# ÚNICA configuración manual que no se puede autodetectar: el comando que arranca
+# tu app. Defínelo en Settings → Secrets and variables → Actions → Variables como
+# IAST_START_CMD (ej: "node dist/server.js", "python -m app", "go run .").
+# Si no lo defines, este workflow se salta solo (no falla el pipeline).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * 1' # semanal
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      primary_language: ${{ steps.detect.outputs.primary_language }}
+      start_cmd_set: ${{ steps.check.outputs.start_cmd_set }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        uses: ./.github/actions/detect-stack
+      - id: check
+        run: echo "start_cmd_set=${{ vars.IAST_START_CMD != '' }}" >> "$GITHUB_OUTPUT"
+
+  iast-aproximado:
+    needs: detect
+    if: needs.detect.outputs.start_cmd_set == 'true'
+    runs-on: ubuntu-latest
+    env:
+      START_CMD: ${{ vars.IAST_START_CMD }}
+      APP_PORT: ${{ vars.DAST_APP_PORT || '8080' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar instrumentación según el lenguaje detectado
+        run: |
+          set -e
+          case "${{ needs.detect.outputs.primary_language }}" in
+            Go) go version ;;
+            Python) python3 -m pip install --quiet coverage ;;
+            TypeScript|JavaScript)
+              [ -f package.json ] && npm ci --silent || true
+              npm install --no-save c8 --silent ;;
+            Java|Kotlin)
+              curl -sSL -o jacocoagent.jar \
+                https://repo1.maven.org/maven2/org/jacoco/org.jacoco.agent/0.8.12/org.jacoco.agent-0.8.12-runtime.jar ;;
+            *)
+              echo "::notice::No tengo receta de cobertura para '${{ needs.detect.outputs.primary_language }}' todavía; la app arrancará sin instrumentación (solo quedará la parte de ataque con ZAP)." ;;
+          esac
+
+      - name: Levantar la app con el agente de cobertura puesto
+        run: |
+          set -e
+          mkdir -p covdata iast-coverage
+          case "${{ needs.detect.outputs.primary_language }}" in
+            Go)
+              GOCOVERDIR="$PWD/covdata" nohup $START_CMD > app.log 2>&1 &
+              ;;
+            Python)
+              nohup coverage run --branch -m $START_CMD > app.log 2>&1 &
+              ;;
+            TypeScript|JavaScript)
+              nohup npx c8 --reporter=json --report-dir=iast-coverage $START_CMD > app.log 2>&1 &
+              ;;
+            Java|Kotlin)
+              nohup java -javaagent:jacocoagent.jar=destfile=jacoco.exec $START_CMD > app.log 2>&1 &
+              ;;
+            *)
+              nohup $START_CMD > app.log 2>&1 &
+              ;;
+          esac
+          echo $! > app.pid
+          for i in $(seq 1 30); do
+            curl -sf "http://localhost:${APP_PORT}" > /dev/null && break
+            sleep 5
+          done
+
+      - name: Atacar la app en ejecución con ZAP (la parte dinámica)
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: http://localhost:${{ env.APP_PORT }}
+          fail_action: false
+
+      - name: Detener la app
+        if: always()
+        run: kill "$(cat app.pid)" 2>/dev/null || true
+
+      - name: Cerrar el reporte de cobertura alcanzada durante el ataque
+        if: always()
+        run: |
+          case "${{ needs.detect.outputs.primary_language }}" in
+            Go) go tool covdata percent -i=covdata || true ;;
+            Python) coverage html -d iast-coverage || true ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: iast-aproximado
+          path: |
+            app.log
+            iast-coverage/**
+            jacoco.exec
+          if-no-files-found: ignore
+
+  recordatorio:
+    needs: detect
+    if: needs.detect.outputs.start_cmd_set != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::notice::IAST_START_CMD no está definido como variable de repo, así que me salto este workflow. No es un error: solo no hay forma de autodetectar cómo arranca tu app. Defínelo en Settings → Secrets and variables → Actions → Variables si quieres esta aproximación de IAST."
